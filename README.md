@@ -331,6 +331,9 @@ You can specify a different starting block height by using the `--fork-height` f
 You can also store all of your changes and cached registers to a persistent db by using the `--persist` flag,
 along with the other SQLite settings.
 
+For implementation notes about remote register fetching and cache behavior in
+fork mode, see [docs/fork-mode-register-fetching.md](./docs/fork-mode-register-fetching.md).
+
 To submit transactions as a different account, you can use the `--skip-tx-validation` flag to disable the transaction
 signature
 verification. Then submit transactions from any account using any valid private key.

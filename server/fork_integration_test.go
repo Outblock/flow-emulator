@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/onflow/cadence"
+	jsoncdc "github.com/onflow/cadence/encoding/json"
 	flowsdk "github.com/onflow/flow-go-sdk"
 	flowgo "github.com/onflow/flow-go/model/flow"
 	flowaccess "github.com/onflow/flow/protobuf/go/flow/access"
@@ -239,6 +240,60 @@ func TestForkingAgainstMainnet(t *testing.T) {
 	require.Equal(t, cadence.Bool(true), scriptResult.Value)
 
 	t.Logf("Account key test successful. Script result: %v", scriptResult.Value)
+}
+
+func TestForkingAgainstMainnetPublicReceiverCapability(t *testing.T) {
+	t.Parallel()
+
+	logger := zerolog.Nop()
+
+	const target = "access.mainnet.nodes.onflow.org:9000"
+	const recipient = "54919e809e115e5e"
+
+	conn, err := grpc.NewClient(
+		target,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		utils.DefaultGRPCRetryInterceptor(),
+	)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	remote := flowaccess.NewAccessAPIClient(conn)
+
+	rh, err := remote.GetLatestBlockHeader(context.Background(), &flowaccess.GetLatestBlockHeaderRequest{IsSealed: true})
+	require.NoError(t, err)
+	remoteHeight := rh.Block.Height - 10
+
+	cfg := &Config{
+		DBPath:                    "",
+		Persist:                   false,
+		Snapshot:                  false,
+		SkipTransactionValidation: true,
+		ChainID:                   flowgo.Mainnet,
+		ForkHost:                  target,
+		ForkHeight:                remoteHeight,
+	}
+
+	srv := NewEmulatorServer(&logger, cfg)
+	require.NotNil(t, srv)
+	require.Equal(t, flowgo.Mainnet, cfg.ChainID)
+
+	script := []byte(`
+		import FungibleToken from 0xf233dcee88fe0abe
+
+		access(all) fun main(account: Address): Bool {
+			return getAccount(account)
+				.capabilities.borrow<&{FungibleToken.Receiver}>(/public/flowTokenReceiver) != nil
+		}
+	`)
+
+	arg, err := jsoncdc.Encode(cadence.NewAddress(flowsdk.HexToAddress(recipient)))
+	require.NoError(t, err)
+
+	scriptResult, err := srv.Emulator().ExecuteScript(script, [][]byte{arg})
+	require.NoError(t, err)
+	require.True(t, scriptResult.Succeeded())
+	require.NoError(t, scriptResult.Error)
+	require.Equal(t, cadence.Bool(true), scriptResult.Value)
 }
 
 // TestForkingWithEVMInteraction exercises EVM functionality in a forked environment

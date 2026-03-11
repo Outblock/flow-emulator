@@ -259,6 +259,9 @@ By default, the forked network will start from the latest sealed block when the 
 You can also store all of your changes and cached registers to a persistent db by using the `--persist` flag,
 along with the other sqlite settings.
 
+For implementation notes about remote register fetching and cache behavior in
+fork mode, see [fork-mode-register-fetching.md](./fork-mode-register-fetching.md).
+
 To submit transactions as a different account, you can use the `--skip-tx-validation` flag to disable transaction signature
 verification. Then submit transactions from any account using any valid private key.
 

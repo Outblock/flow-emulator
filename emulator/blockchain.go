@@ -393,6 +393,11 @@ type Blockchain struct {
 	computationReport *ComputationReport
 }
 
+const (
+	slowTransactionExecutionThreshold = 750 * time.Millisecond
+	slowAutoMineThreshold             = 1 * time.Second
+)
+
 // config is a set of configuration options for an emulated emulator.
 type config struct {
 	ServiceKey                   ServiceKey
@@ -1269,23 +1274,64 @@ func (b *Blockchain) SendTransaction(flowTx *flowgo.TransactionBody) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	start := time.Now()
+	addStart := time.Now()
 	err := b.addTransaction(*flowTx)
+	addElapsed := time.Since(addStart)
 	if err != nil {
+		b.conf.ServerLogger.Warn().
+			Str("txID", flowTx.ID().String()).
+			Dur("addElapsed", addElapsed).
+			Dur("totalElapsed", time.Since(start)).
+			Err(err).
+			Msg("✉️  SendTransaction failed before execution")
 		return err
 	}
 
+	autoMineElapsed := time.Duration(0)
 	if b.conf.AutoMine {
+		autoMineStart := time.Now()
 		_, _, err := b.executeAndCommitBlock()
+		autoMineElapsed = time.Since(autoMineStart)
 		if err != nil {
 			// Auto-mine should not leave the emulator permanently stuck in a
 			// started pending block on fatal execution/storage errors.
 			resetErr := b.resetPendingBlock()
 			if resetErr != nil {
+				b.conf.ServerLogger.Warn().
+					Str("txID", flowTx.ID().String()).
+					Dur("addElapsed", addElapsed).
+					Dur("autoMineElapsed", autoMineElapsed).
+					Dur("totalElapsed", time.Since(start)).
+					Err(err).
+					Msg("✉️  SendTransaction auto-mine failed and reset pending block failed")
 				return fmt.Errorf("auto-mine failed: %w (pending block reset failed: %v)", err, resetErr)
 			}
+			b.conf.ServerLogger.Warn().
+				Str("txID", flowTx.ID().String()).
+				Dur("addElapsed", addElapsed).
+				Dur("autoMineElapsed", autoMineElapsed).
+				Dur("totalElapsed", time.Since(start)).
+				Err(err).
+				Msg("✉️  SendTransaction auto-mine failed")
 			return err
 		}
 	}
+
+	totalElapsed := time.Since(start)
+	level := b.conf.ServerLogger.Debug()
+	if totalElapsed >= slowAutoMineThreshold {
+		level = b.conf.ServerLogger.Warn()
+	}
+	level.
+		Str("txID", flowTx.ID().String()).
+		Dur("addElapsed", addElapsed).
+		Dur("autoMineElapsed", autoMineElapsed).
+		Dur("totalElapsed", totalElapsed).
+		Int("scriptBytes", len(flowTx.Script)).
+		Int("argCount", len(flowTx.Arguments)).
+		Int("authorizerCount", len(flowTx.Authorizers)).
+		Msg("✉️  SendTransaction completed")
 
 	return nil
 }
@@ -1377,6 +1423,7 @@ func (b *Blockchain) ExecuteNextTransaction() (*types.TransactionResult, error) 
 // executeNextTransaction is a helper function for ExecuteBlock and ExecuteNextTransaction that
 // executes the next transaction in the pending block.
 func (b *Blockchain) executeNextTransaction(ctx fvm.Context) (*types.TransactionResult, error) {
+	start := time.Now()
 	// check if there are remaining txs to be executed
 	if b.pendingBlock.ExecutionComplete() {
 		return nil, &types.PendingBlockTransactionsExhaustedError{
@@ -1399,12 +1446,24 @@ func (b *Blockchain) executeNextTransaction(ctx fvm.Context) (*types.Transaction
 	// use the computer to execute the next transaction
 	output, err := b.pendingBlock.ExecuteNextTransaction(b.vm, ctx)
 	if err != nil {
+		b.conf.ServerLogger.Warn().
+			Str("txID", txnID.String()).
+			Uint64("blockHeight", b.pendingBlock.Block().Height).
+			Dur("elapsed", time.Since(start)).
+			Err(err).
+			Msg("⏱️  transaction execution failed")
 		// fail fast if fatal error occurs
 		return nil, err
 	}
 
 	tr, err := convert.VMTransactionResultToEmulator(txnID, output)
 	if err != nil {
+		b.conf.ServerLogger.Warn().
+			Str("txID", txnID.String()).
+			Uint64("blockHeight", b.pendingBlock.Block().Height).
+			Dur("elapsed", time.Since(start)).
+			Err(err).
+			Msg("⏱️  transaction result conversion failed")
 		// fail fast if fatal error occurs
 		return nil, err
 	}
@@ -1435,6 +1494,27 @@ func (b *Blockchain) executeNextTransaction(ctx fvm.Context) (*types.Transaction
 			output.ComputationIntensities,
 		)
 	}
+
+	elapsed := time.Since(start)
+	level := b.conf.ServerLogger.Debug()
+	if elapsed >= slowTransactionExecutionThreshold || tr.Error != nil {
+		level = b.conf.ServerLogger.Warn()
+	}
+	event := level.
+		Str("txID", txnID.String()).
+		Uint64("blockHeight", b.pendingBlock.Block().Height).
+		Dur("elapsed", elapsed).
+		Int("scriptBytes", len(txnBody.Script)).
+		Int("argCount", len(txnBody.Arguments)).
+		Int("eventCount", len(tr.Events)).
+		Int("logCount", len(tr.Logs)).
+		Uint64("computeUnitsUsed", tr.ComputationUsed).
+		Uint64("memoryEstimate", tr.MemoryEstimate).
+		Bool("success", tr.Succeeded())
+	if tr.Error != nil {
+		event = event.Err(tr.Error)
+	}
+	event.Msg("⏱️  transaction execution finished")
 
 	return tr, nil
 }
@@ -1600,24 +1680,37 @@ func (b *Blockchain) ExecuteAndCommitBlock() (*flowgo.Block, []*types.Transactio
 
 // ExecuteAndCommitBlock is a utility that combines ExecuteBlock with CommitBlock.
 func (b *Blockchain) executeAndCommitBlock() (*flowgo.Block, []*types.TransactionResult, error) {
+	start := time.Now()
 	results, err := b.executeBlock()
 	if err != nil {
 		return nil, nil, err
 	}
+	executeElapsed := time.Since(start)
 
+	commitStart := time.Now()
 	block, err := b.commitBlock()
 	if err != nil {
 		return nil, results, err
 	}
+	commitElapsed := time.Since(commitStart)
 
 	for _, result := range results {
 		utils.PrintTransactionResult(&b.conf.ServerLogger, result)
 	}
 
 	blockID := block.ID()
-	b.conf.ServerLogger.Debug().Fields(map[string]any{
-		"blockHeight": block.Height,
-		"blockID":     hex.EncodeToString(blockID[:]),
+	totalElapsed := time.Since(start)
+	level := b.conf.ServerLogger.Debug()
+	if totalElapsed >= slowAutoMineThreshold {
+		level = b.conf.ServerLogger.Warn()
+	}
+	level.Fields(map[string]any{
+		"blockHeight":    block.Height,
+		"blockID":        hex.EncodeToString(blockID[:]),
+		"txCount":        len(results),
+		"executeElapsed": executeElapsed,
+		"commitElapsed":  commitElapsed,
+		"totalElapsed":   totalElapsed,
 	}).Msgf("📦 Block #%d committed", block.Height)
 
 	return block, results, nil

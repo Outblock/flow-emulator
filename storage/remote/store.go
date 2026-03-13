@@ -65,6 +65,11 @@ const (
 	// GetRegisterValues RPC. The access-node API supports arrays, but the
 	// original emulator only ever sent 1 at a time.
 	batchSize = 50
+
+	slowRegisterFetchThreshold   = 500 * time.Millisecond
+	slowRegisterResolveThreshold = 750 * time.Millisecond
+	slowOwnerPrefetchThreshold   = 500 * time.Millisecond
+	sampledRegisterLogLimit      = 4
 )
 
 type Store struct {
@@ -82,6 +87,59 @@ type Store struct {
 	// invalidation. This eliminates redundant SQLite reads and gRPC calls
 	// across snapshots / blocks.
 	globalCache *lru.Cache[string, flowgo.RegisterValue]
+}
+
+func sampleRegisterIDs(ids []flowgo.RegisterID, limit int) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	if limit <= 0 || limit > len(ids) {
+		limit = len(ids)
+	}
+
+	sampled := make([]string, 0, limit)
+	for _, id := range ids[:limit] {
+		key := id.String()
+		if len(key) > 96 {
+			key = key[:96] + "..."
+		}
+		sampled = append(sampled, key)
+	}
+
+	return sampled
+}
+
+func (s *Store) logRegisterResolve(
+	id flowgo.RegisterID,
+	blockHeight uint64,
+	lookupHeight uint64,
+	source string,
+	elapsed time.Duration,
+	value flowgo.RegisterValue,
+	err error,
+) {
+	if err == nil && elapsed < slowRegisterResolveThreshold {
+		return
+	}
+
+	level := s.logger.Debug()
+	if err != nil || elapsed >= 2*slowRegisterResolveThreshold {
+		level = s.logger.Warn()
+	}
+
+	event := level.
+		Str("register", id.String()).
+		Uint64("blockHeight", blockHeight).
+		Uint64("lookupHeight", lookupHeight).
+		Str("source", source).
+		Dur("elapsed", elapsed).
+		Int("valueBytes", len(value))
+
+	if err != nil {
+		event = event.Err(err)
+	}
+
+	event.Msg("resolved register")
 }
 
 type Option func(*Store)
@@ -314,6 +372,7 @@ func (s *Store) getRegisterSingle(
 	id flowgo.RegisterID,
 	lookupHeight uint64,
 ) (flowgo.RegisterValue, bool, error) {
+	start := time.Now()
 	callCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
 	defer cancel()
 
@@ -324,27 +383,60 @@ func (s *Store) getRegisterSingle(
 	})
 
 	if err != nil {
+		elapsed := time.Since(start)
 		code := status.Code(err)
 		if code == codes.NotFound || code == codes.DeadlineExceeded || code == codes.InvalidArgument {
 			level := s.logger.Warn()
 			if code == codes.NotFound {
 				level = s.logger.Debug()
 			}
-			level.
+			event := level.
 				Str("register", id.String()).
 				Uint64("height", lookupHeight).
-				Err(err).
-				Msg("register fetch failed")
+				Str("grpcCode", code.String()).
+				Dur("elapsed", elapsed).
+				Err(err)
 			if code == codes.NotFound {
+				event.Msg("remote register fetch miss")
 				return nil, false, nil
 			}
+			event.Msg("remote register fetch failed")
 			return nil, false, err
 		}
+		s.logger.Warn().
+			Str("register", id.String()).
+			Uint64("height", lookupHeight).
+			Str("grpcCode", code.String()).
+			Dur("elapsed", elapsed).
+			Err(err).
+			Msg("remote register fetch failed")
 		return nil, false, err
 	}
 
 	if response != nil && len(response.Values) > 0 {
-		return response.Values[0], true, nil
+		value := response.Values[0]
+		elapsed := time.Since(start)
+		if elapsed >= slowRegisterFetchThreshold {
+			level := s.logger.Debug()
+			if elapsed >= 2*slowRegisterFetchThreshold {
+				level = s.logger.Warn()
+			}
+			level.
+				Str("register", id.String()).
+				Uint64("height", lookupHeight).
+				Dur("elapsed", elapsed).
+				Int("valueBytes", len(value)).
+				Msg("remote register fetch completed")
+		}
+		return value, true, nil
+	}
+
+	if elapsed := time.Since(start); elapsed >= slowRegisterFetchThreshold {
+		s.logger.Debug().
+			Str("register", id.String()).
+			Uint64("height", lookupHeight).
+			Dur("elapsed", elapsed).
+			Msg("remote register fetch returned no values")
 	}
 	return nil, false, nil
 }
@@ -357,6 +449,7 @@ func (s *Store) getRegisterBatch(
 	ids []flowgo.RegisterID,
 	lookupHeight uint64,
 ) map[string]flowgo.RegisterValue {
+	start := time.Now()
 	callCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
 	defer cancel()
 
@@ -372,17 +465,42 @@ func (s *Store) getRegisterBatch(
 
 	result := make(map[string]flowgo.RegisterValue, len(ids))
 	if err != nil {
-		s.logger.Warn().Err(err).Int("count", len(ids)).Msg("batch register fetch failed")
+		elapsed := time.Since(start)
+		s.logger.Warn().
+			Err(err).
+			Str("grpcCode", status.Code(err).String()).
+			Uint64("height", lookupHeight).
+			Int("count", len(ids)).
+			Dur("elapsed", elapsed).
+			Strs("sampleRegisters", sampleRegisterIDs(ids, sampledRegisterLogLimit)).
+			Msg("batch register fetch failed")
 		return result
 	}
 
+	returned := 0
 	if response != nil {
+		returned = len(response.Values)
 		for i, val := range response.Values {
 			if i < len(ids) {
 				result[ids[i].String()] = val
 			}
 		}
 	}
+
+	if elapsed := time.Since(start); elapsed >= slowRegisterFetchThreshold || returned != len(ids) {
+		level := s.logger.Debug()
+		if elapsed >= 2*slowRegisterFetchThreshold {
+			level = s.logger.Warn()
+		}
+		level.
+			Uint64("height", lookupHeight).
+			Int("count", len(ids)).
+			Int("returned", returned).
+			Dur("elapsed", elapsed).
+			Strs("sampleRegisters", sampleRegisterIDs(ids, sampledRegisterLogLimit)).
+			Msg("batch register fetch completed")
+	}
+
 	return result
 }
 
@@ -397,6 +515,7 @@ func (s *Store) resolveRegister(
 	id flowgo.RegisterID,
 	blockHeight uint64,
 ) (flowgo.RegisterValue, error) {
+	start := time.Now()
 	key := id.String()
 
 	// Fork-height state is immutable; anything above fork height can be mutated
@@ -424,6 +543,7 @@ func (s *Store) resolveRegister(
 		if useGlobalCache {
 			s.globalCache.Add(key, value)
 		}
+		s.logRegisterResolve(id, blockHeight, blockHeight, "local-store", time.Since(start), value, nil)
 		return value, nil
 	}
 
@@ -435,11 +555,13 @@ func (s *Store) resolveRegister(
 
 	value, found, err := s.getRegisterSingle(ctx, id, lookupHeight)
 	if err != nil {
+		s.logRegisterResolve(id, blockHeight, lookupHeight, "remote-error", time.Since(start), nil, err)
 		return nil, err
 	}
 	if !found {
 		// Missing registers are represented as empty values to the FVM, but do
 		// not persist them locally: a speculative miss should not poison caches.
+		s.logRegisterResolve(id, blockHeight, lookupHeight, "remote-miss", time.Since(start), nil, nil)
 		return nil, nil
 	}
 
@@ -455,6 +577,7 @@ func (s *Store) resolveRegister(
 		lookupHeight,
 	)
 
+	s.logRegisterResolve(id, blockHeight, lookupHeight, "remote-hit", time.Since(start), value, nil)
 	return value, nil
 }
 
@@ -468,6 +591,7 @@ func (s *Store) resolveRegister(
 // harmful. We rely on resolveRegister to lazily fetch and cache the exact slab
 // keys the FVM touches.
 func (s *Store) prefetchRegistersForOwner(ctx context.Context, owner string, lookupHeight uint64) {
+	start := time.Now()
 	metaKeys := []string{
 		flowgo.AccountStatusKey,
 		flowgo.AccountPublicKey0RegisterKey,
@@ -501,10 +625,18 @@ func (s *Store) prefetchRegistersForOwner(ctx context.Context, owner string, loo
 			// Do NOT cache missing keys — let resolveRegister retry individually
 		}
 
-		s.logger.Debug().
+		elapsed := time.Since(start)
+		level := s.logger.Debug()
+		if elapsed >= slowOwnerPrefetchThreshold {
+			level = s.logger.Warn()
+		}
+		level.
 			Str("owner", fmt.Sprintf("%x", owner)).
+			Uint64("height", lookupHeight).
 			Int("fetched", len(metaIDs)).
 			Int("cached", cached).
+			Int("missed", len(metaIDs)-cached).
+			Dur("elapsed", elapsed).
 			Msg("prefetched metadata for owner")
 	}
 }

@@ -48,6 +48,8 @@ type AccessAdapter struct {
 	emulator emulator.Emulator
 }
 
+const slowAccessAdapterCallThreshold = 750 * time.Millisecond
+
 // NewAccessAdapter returns a new AccessAdapter.
 func NewAccessAdapter(logger *zerolog.Logger, emulator emulator.Emulator) *AccessAdapter {
 	return &AccessAdapter{
@@ -315,18 +317,55 @@ func (a *AccessAdapter) ExecuteScriptAtLatestBlock(
 	script []byte,
 	arguments [][]byte,
 ) ([]byte, error) {
+	start := time.Now()
+	latestBlockStart := time.Now()
 	latestBlock, err := a.emulator.GetLatestBlock()
+	latestBlockElapsed := time.Since(latestBlockStart)
 	if err != nil {
+		a.logger.Warn().
+			Err(err).
+			Int("scriptBytes", len(script)).
+			Int("argCount", len(arguments)).
+			Dur("latestBlockElapsed", latestBlockElapsed).
+			Msg("👤  ExecuteScriptAtLatestBlock failed to resolve latest block")
 		return nil, err
 	}
-	a.logger.Debug().
-		Uint64("blockHeight", latestBlock.Height).
-		Msg("👤  ExecuteScriptAtLatestBlock called")
 
+	executeStart := time.Now()
 	result, err := a.emulator.ExecuteScript(script, arguments)
+	executeElapsed := time.Since(executeStart)
+	totalElapsed := time.Since(start)
 	if err == nil {
 		utils.PrintScriptResult(a.logger, result)
 	}
+
+	success := err == nil && result != nil && result.Succeeded()
+	level := a.logger.Debug()
+	if err != nil || !success || totalElapsed >= slowAccessAdapterCallThreshold {
+		level = a.logger.Warn()
+	}
+	event := level.
+		Uint64("blockHeight", latestBlock.Height).
+		Int("scriptBytes", len(script)).
+		Int("argCount", len(arguments)).
+		Dur("latestBlockElapsed", latestBlockElapsed).
+		Dur("executeElapsed", executeElapsed).
+		Dur("totalElapsed", totalElapsed).
+		Bool("success", success)
+	if result != nil {
+		event = event.
+			Uint64("computeUnitsUsed", result.ComputationUsed).
+			Uint64("memoryEstimate", result.MemoryEstimate).
+			Int("eventCount", len(result.Events)).
+			Int("logCount", len(result.Logs))
+	}
+	if err != nil {
+		event = event.Err(err)
+	} else if result != nil && result.Error != nil {
+		event = event.Err(result.Error)
+	}
+	event.Msg("👤  ExecuteScriptAtLatestBlock completed")
+
 	return convertScriptResult(result, err)
 }
 
@@ -659,11 +698,31 @@ func (a *AccessAdapter) GetTransactionResultsByBlockID(
 }
 
 func (a *AccessAdapter) SendTransaction(_ context.Context, tx *flowgo.TransactionBody) error {
+	start := time.Now()
 	a.logger.Debug().
 		Str("txID", tx.ID().String()).
 		Msg(`✉️   Transaction submitted`)
 
-	return convertError(a.emulator.SendTransaction(tx), codes.Internal)
+	err := a.emulator.SendTransaction(tx)
+	elapsed := time.Since(start)
+
+	level := a.logger.Debug()
+	if err != nil || elapsed >= slowAccessAdapterCallThreshold {
+		level = a.logger.Warn()
+	}
+	event := level.
+		Str("txID", tx.ID().String()).
+		Int("scriptBytes", len(tx.Script)).
+		Int("argCount", len(tx.Arguments)).
+		Int("authorizerCount", len(tx.Authorizers)).
+		Uint64("gasLimit", tx.GasLimit).
+		Dur("elapsed", elapsed)
+	if err != nil {
+		event = event.Err(err)
+	}
+	event.Msg("✉️   Transaction send completed")
+
+	return convertError(err, codes.Internal)
 }
 
 func (a *AccessAdapter) GetNodeVersionInfo(

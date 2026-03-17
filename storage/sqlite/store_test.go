@@ -19,6 +19,7 @@
 package sqlite
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -49,4 +50,58 @@ func TestNew(t *testing.T) {
 		"no such file or directory",
 		"should return an error indicating the location is invalid",
 	)
+}
+
+func TestLoadSnapshotDoesNotMutateSnapshotFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	store, err := New(dir)
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, store.Close())
+	}()
+
+	require.NoError(t, store.SetBlockHeight(1))
+	require.NoError(t, store.CreateSnapshot("base"))
+
+	require.NoError(t, store.SetBlockHeight(2))
+	require.NoError(t, store.LoadSnapshot("base"))
+
+	height, err := store.LatestBlockHeight(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), height)
+
+	require.NoError(t, store.SetBlockHeight(3))
+	require.NoError(t, store.LoadSnapshot("base"))
+
+	height, err = store.LatestBlockHeight(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), height)
+}
+
+func TestCreateSnapshotOverwritesExistingFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	store, err := New(dir)
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, store.Close())
+	}()
+
+	require.NoError(t, store.SetBlockHeight(1))
+	require.NoError(t, store.CreateSnapshot("base"))
+
+	require.NoError(t, store.SetBlockHeight(2))
+	require.NoError(t, store.CreateSnapshot("base"))
+	require.NoError(t, store.SetBlockHeight(3))
+
+	require.NoError(t, store.LoadSnapshot("base"))
+
+	height, err := store.LatestBlockHeight(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), height)
 }

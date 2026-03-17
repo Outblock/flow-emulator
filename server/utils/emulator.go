@@ -216,6 +216,7 @@ func (m EmulatorAPIServer) SnapshotJump(w http.ResponseWriter, r *http.Request) 
 func (m EmulatorAPIServer) SnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	name := r.FormValue("name")
+	replace, _ := strconv.ParseBool(strings.TrimSpace(r.FormValue("replace")))
 
 	if name == "" {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -227,7 +228,7 @@ func (m EmulatorAPIServer) SnapshotCreate(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if slices.Contains(snapshots, name) {
+	if slices.Contains(snapshots, name) && !replace {
 		w.WriteHeader(http.StatusConflict)
 		return
 	}

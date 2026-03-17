@@ -27,6 +27,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -142,6 +143,46 @@ func (s *Store) RollbackToBlockHeight(height uint64) error {
 
 const snapshotPrefix = "snapshot_"
 
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = out.Close()
+	}()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+
+	return out.Sync()
+}
+
+func removeSQLiteArtifacts(basePath string, removeDB bool) {
+	if removeDB {
+		_ = os.Remove(basePath)
+	}
+	_ = os.Remove(basePath + "-wal")
+	_ = os.Remove(basePath + "-shm")
+	_ = os.Remove(basePath + "-journal")
+}
+
+func (s *Store) rememberSnapshot(name string) {
+	for _, existing := range s.snapshotNames {
+		if existing == name {
+			return
+		}
+	}
+	s.snapshotNames = append(s.snapshotNames, name)
+}
+
 func (s *Store) Snapshots() (snapshots []string, err error) {
 	if !s.SupportSnapshotsWithCurrentConfig() {
 		return []string{}, fmt.Errorf("snapshot is not supported with current configuration")
@@ -176,6 +217,7 @@ func (s *Store) LoadSnapshot(name string) error {
 	}
 
 	var dbFile string
+	shouldCloseExisting := true
 	if s.url == InMemory {
 		dbFile = fmt.Sprintf("file:%s%d?mode=memory&cache=shared", name, s.id)
 		db, err := sql.Open("sqlite", dbFile)
@@ -195,11 +237,32 @@ func (s *Store) LoadSnapshot(name string) error {
 			return fmt.Errorf("snapshot %s does not exist", name)
 		}
 	} else {
-		dbFile = filepath.Join(s.url, snapshotPrefix+name)
-		_, err := os.Stat(dbFile)
+		snapshotFile := filepath.Join(s.url, snapshotPrefix+name)
+		_, err := os.Stat(snapshotFile)
 		if os.IsNotExist(err) {
 			return fmt.Errorf("snapshot %s does not exist", name)
 		}
+
+		liveDBFile := filepath.Join(s.url, "emulator.sqlite")
+		tempDBFile := liveDBFile + ".tmp"
+
+		if err := s.db.Close(); err != nil {
+			return err
+		}
+		shouldCloseExisting = false
+
+		_ = os.Remove(tempDBFile)
+		removeSQLiteArtifacts(liveDBFile, false)
+
+		if err := copyFile(snapshotFile, tempDBFile); err != nil {
+			return err
+		}
+		if err := os.Rename(tempDBFile, liveDBFile); err != nil {
+			_ = os.Remove(tempDBFile)
+			return err
+		}
+
+		dbFile = liveDBFile
 	}
 
 	db, err := sql.Open("sqlite", dbFile)
@@ -207,9 +270,11 @@ func (s *Store) LoadSnapshot(name string) error {
 		return err
 	}
 
-	err = s.db.Close()
-	if err != nil {
-		return err
+	if shouldCloseExisting {
+		err = s.db.Close()
+		if err != nil {
+			return err
+		}
 	}
 
 	s.db = db
@@ -240,13 +305,14 @@ func (s *Store) CreateSnapshot(name string) error {
 
 	} else {
 		dbFile = filepath.Join(s.url, snapshotPrefix+name)
+		removeSQLiteArtifacts(dbFile, true)
 	}
 
 	_, err := s.db.Exec(fmt.Sprintf("VACUUM main INTO '%s'", dbFile))
 	if err != nil {
 		return err
 	}
-	s.snapshotNames = append(s.snapshotNames, name)
+	s.rememberSnapshot(name)
 	return nil
 }
 
